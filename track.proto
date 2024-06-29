@@ -1,0 +1,33 @@
+syntax = "proto2";
+
+package osm_snapped_way;
+
+import "google/protobuf/timestamp.proto";
+
+message PointAlongSegment {
+  // Both required.
+  optional uint64 node_id_0 = 1;
+  optional uint64 node_id_1 = 2;
+
+  // Must be strictly between 0.0 (close to node_id_0)
+  // and 1.0 (close to node_id_1).
+  optional float distance = 3;
+}
+
+message TrackPoint {
+  optional google.protobuf.Timestamp timestamp = 1;
+
+  optional uint64 way_id = 2;
+  oneof point {
+    // Track point is exactly on a node.
+    uint64 exact_node_id = 3;
+    PointAlongSegment point_along_segment = 4;
+  }
+
+  optional float speed = 5;  // metres/second
+  optional float elevation = 6;
+}
+
+message Track {
+  repeated TrackPoint p = 1;
+}

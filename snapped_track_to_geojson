@@ -1,0 +1,48 @@
+#!/usr/bin/python3
+
+import json
+import sys
+
+from osmcachelib import get_node_data
+import track_pb2
+
+
+track = track_pb2.Track()
+track.ParseFromString(sys.stdin.buffer.read())
+
+def get_triples(track):
+    for p in track.p:
+        if p.HasField('exact_node_id'):
+            node = get_node_data(p.exact_node_id)
+            node_element = node['elements'][0]
+            lat, lon = node_element['lat'], node_element['lon']
+        elif p.HasField('point_along_segment'):
+            # Here we just interpolate lat and lon directly without
+            # converting to cartesian. It's wrog but it will do.
+            node0 = get_node_data(p.point_along_segment.node_id_0)
+            node1 = get_node_data(p.point_along_segment.node_id_1)
+            e0 = node0['elements'][0]
+            e1 = node1['elements'][0]
+            lat = e0['lat'] + (e1['lat'] - e0['lat']) * p.point_along_segment.distance
+            lon = e0['lon'] + (e1['lon'] - e0['lon']) * p.point_along_segment.distance
+        else:
+            raise RuntimeError('no point in TrackPoint')
+        yield lon, lat, p.elevation
+
+coordinates = list(get_triples(track))
+
+geojson = {
+    'type': 'FeatureCollection',
+    'features': [{
+        'type': 'Feature',
+        'properties': {
+            'name': 'snapped',
+        },
+        'geometry': {
+            'type': 'LineString',
+            'coordinates': coordinates,
+        },
+    }],
+}
+
+json.dump(geojson, sys.stdout)

@@ -1,0 +1,206 @@
+#!/usr/bin/python3
+
+import sys
+from google.protobuf import timestamp_pb2
+from leuvenmapmatching.map.inmem import InMemMap
+from leuvenmapmatching.map.sqlite import SqliteMap
+from leuvenmapmatching.matcher import distance
+from leuvenmapmatching import logger
+from osmnx import graph
+from osmnx import utils_graph
+from osmnx import projection
+from osmnx import settings
+import gpxpy
+import logging
+import math
+import time
+
+from osmcachelib import get_way_data, get_node_data
+import track_pb2
+
+#settings.log_console = True
+#settings.log_level = logging.INFO
+
+
+def dbg(msg):
+    print(time.asctime().strip(), end=": ", file=sys.stderr)
+    print(msg, file=sys.stderr)
+
+
+def get_points(gpxfile):
+    with open(gpxfile) as f:
+        gpx = gpxpy.parse(f)
+        return gpx.tracks[0].segments[0].points
+
+
+def make_match(points):
+    track = [(p.latitude, p.longitude, p.time) for p in points]
+
+    # Find the bounding box
+    north = max(lat for (lat, long, ts) in track)+0.02
+    south = min(lat for (lat, long, ts) in track)-0.02
+    east = min(long for (lat, long, ts) in track)-0.02
+    west = max(long for (lat, long, ts) in track)+0.02
+    
+    #map_con = SqliteMap("myosm", use_latlon=True)
+    map_con = InMemMap("myosm", use_latlon=True, use_rtree=True, index_edges=True)
+
+    # Fetch the tiles to cover the bounding box
+    dbg(f"Loading tiles ({north},{east}) ({south},{west})")
+    gr = graph.graph_from_bbox(bbox=(north, south, east, west), simplify=False, retain_all=True, custom_filter='["railway"]["railway"!~"abandoned|construction|disused|miniature"]')
+
+    dbg("Projecting")
+    graph_proj = projection.project_graph(gr, to_latlong=True)
+
+    dbg("Converting to gdf")
+    # Load the map into the db
+    nodes_proj, edges_proj = utils_graph.graph_to_gdfs(graph_proj, nodes=True, edges=True)
+    dbg(f"Adding {len(nodes_proj[['x', 'y']])} nodes")
+    for nid, row in nodes_proj[['x', 'y']].iterrows():
+        map_con.add_node(nid, (row['y'], row['x']))
+    dbg(f"Adding {len(edges_proj)} edges")
+    for eid, _ in edges_proj.iterrows():
+        map_con.add_edge(eid[0], eid[1])
+
+    dbg("Creating distant matcher")
+    matcher = distance.DistanceMatcher(map_con,
+                         max_dist=100,
+                         max_dist_init=25,  # meter
+                         min_prob_norm=0.001,
+                         non_emitting_length_factor=0.75,
+                         obs_noise=50,
+                         obs_noise_ne=75,  # meter
+                         dist_noise=50,  # meter
+                         non_emitting_states=True,
+                         max_lattice_width=5)
+    dbg("Running matcher")
+    states, lastidx = matcher.match(track)
+    dbg(f"Matched {lastidx}/{len(track)}")
+
+    return states, edges_proj, matcher.lattice_best
+
+
+def latlon_to_xy(lat, lon):
+    """LatLon in degrees to (x,y) in cartesian arbitrary units."""
+    lat_r = math.radians(lat)
+    lon_r = math.radians(lon)
+    a_y = math.sin(lat_r/2) * math.sin(lat_r/2)
+    y = 2 * math.atan2(math.sqrt(a_y), math.sqrt(1-a_y))
+    a_x = math.cos(lat_r) * math.sin(lon_r/2) * math.sin(lon_r/2)
+    x = 2 * math.atan2(math.sqrt(a_x), math.sqrt(1-a_x))
+    radius = 6371000
+    return x * radius, y * radius
+
+
+def dot(v0, v1):
+    return v0[0]*v1[0] + v0[1]*v1[1]
+
+
+def location_on_line(p, l0, l1):
+    """Inputs (x,y). Returns (frac, outside, dist).
+
+    frac: fraction of the way along the line (l0,l1) that p makes
+          its closest approach to the line.
+    outside: True if p is not between l0 and l1. In this case frac
+             is 0.0 if p is closer to l0 and 1.0 if p is closer to l1.
+    dist: distance of p away from the line at its closest approach.
+          If outside, distance to l0 or l1, whichever is closest.
+    """
+    v_line = l1[0]-l0[0], l1[1]-l0[1]
+    v_p = p[0]-l0[0], p[1]-l0[1]
+    d = dot(v_line, v_p)
+    mag_line = dot(v_line, v_line)**0.5
+    mag_p = dot(v_p, v_p)**0.5
+    try:
+        angle_l0 = math.acos(d/mag_line/mag_p)
+    except ZeroDivisionError:
+        # either mag_line or mag_p is zero but we assume mag_line
+        # if not zero since that would be a bad line. So that
+        # means p==l0.
+        return 0.0, False, 0.0
+    if angle_l0 > math.pi/2:
+        return 0.0, True, mag_p  # p is behind l0
+    elif angle_l0 == math.pi/2:
+        return 0.0, False, mag_p  # perpendicular
+    d = mag_p * math.sin(angle_l0)
+    frac = math.sqrt(mag_p*mag_p - d*d) / mag_line
+    if frac > 1.0:
+        l1_to_p = p[0]-l1[0], p[1]-l1[1]
+        return 1.0, True, dot(l1_to_p, l1_to_p)**0.5
+    return frac, False, d
+
+
+def get_node_xy(oid):
+    node = get_node_data(oid)
+    node_element = node['elements'][0]
+    return latlon_to_xy(node_element['lat'], node_element['lon'])
+
+
+def location_along_way(p, way_id):
+    """Given p=(x,y) and way_id it has been snapped to, return a TrackPoint."""
+    way = get_way_data(way_id)
+    way_element = way['elements'][0]
+    nodes = way_element['nodes']
+    assert len(nodes) >= 2
+    line = [(nid, get_node_xy(nid)) for nid in nodes]
+
+    # Find the line segment along the way which our point is closest to,
+    # rejecting every line segment where the point is outside the bounds.
+    min_d, min_lid0, min_lid1, min_frac = None, None, None, None
+    lid0, lp0 = line[0]
+    for lid1, lp1 in line[1:]:
+        frac, outside, d = location_on_line(p, lp0, lp1)
+        if not outside and (min_d is None or d < min_d):
+            min_d, min_lid0, min_lid1, min_frac = d, lid0, lid1, frac
+        lid0, lp0 = lid1, lp1
+
+    # Now see if we are closer to one of the points themselves.
+    # There are cases where the point is between 2 segments forming an
+    # obtuse angle where we'll select a different line segment that
+    # curves toward the point farther away, but that's not right.
+    # This should fix that and also handle the case where we were
+    # outside all segments.
+    for lid, lp in line:
+        v = p[0]-lp[0], p[1]-lp[1]
+        d = dot(v, v)**0.5
+        if min_d is None or d < min_d:
+            min_d, min_lid0, min_lid1, min_frac = d, lid, lid, 0.0
+
+    ret = track_pb2.TrackPoint(way_id=way_id)
+    if min_frac == 0.0:
+        ret.exact_node_id = min_lid0
+    elif min_frac == 1.0:
+        ret.exact_node_id = min_lid1
+    else:
+        pas = ret.point_along_segment
+        pas.node_id_0 = min_lid0
+        pas.node_id_1 = min_lid1
+        pas.distance = min_frac
+    return ret
+
+
+def gen_track(states, edges_proj, lattice_best, points):
+    track = track_pb2.Track()
+    for segment, state in zip(lattice_best, states):
+        osm_id = edges_proj['osmid'][(segment.edge_m.l1, segment.edge_m.l2, 0)]
+        orig_trackpoint = points[segment.obs]
+        gpxp = latlon_to_xy(orig_trackpoint.latitude, orig_trackpoint.longitude)
+        p = location_along_way(gpxp, osm_id)
+        p.timestamp.FromDatetime(dt=orig_trackpoint.time)
+        if orig_trackpoint.speed is not None:
+            p.speed = orig_trackpoint.speed
+        if orig_trackpoint.elevation is not None:
+            p.elevation = orig_trackpoint.elevation
+        track.p.append(p)
+    return track
+
+
+def main():
+    points = get_points(sys.argv[1])
+    states, edges_proj, lattice_best = make_match(points)
+    track = gen_track(states, edges_proj, lattice_best, points)
+    sys.stdout.buffer.write(track.SerializeToString())
+
+
+if __name__ == '__main__':
+    main()
