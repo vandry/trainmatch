@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import datetime
 import sys
 from google.protobuf import timestamp_pb2
 from leuvenmapmatching.map.inmem import InMemMap
@@ -195,11 +196,53 @@ def gen_track(states, edges_proj, lattice_best, points):
     return track
 
 
+def gcdistance(lat1, lon1, lat2, lon2):
+    """Great circle angular distance between (lat1,lon1) and (lat2,lon2)."""
+    lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    sdlat = math.sin(dlat/2)
+    sdlon = math.sin(dlon/2)
+    a = sdlat*sdlat + math.cos(lat1) * math.cos(lat2) * sdlon*sdlon
+    return 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+DISCONNECT_TIME = datetime.timedelta(seconds=30)
+IMPLAUSIBLE_SPEED = 2e-5  # about 127m/s = 458km/h
+
+
+def is_discontinuous(p0, p1):
+    dx = gcdistance(p0.latitude, p0.longitude, p1.latitude, p1.longitude)
+    dt = p1.time - p0.time
+    if dt > DISCONNECT_TIME:
+        return True
+    dt_sec = dt.seconds + dt.microseconds / 1000000.0
+    speed = dx / dt_sec
+    if speed > IMPLAUSIBLE_SPEED:
+        return True
+    return False
+
+
+def disconnect_segments(concatenated_points):
+    current_segment = []
+    for p in concatenated_points:
+        if current_segment:
+            if is_discontinuous(current_segment[-1], p):
+                yield current_segment
+                current_segment = []
+        current_segment.append(p)
+    if current_segment:
+        yield current_segment
+
+
 def main():
+    out = track_pb2.TrackSequence()
     points = get_points(sys.argv[1])
-    states, edges_proj, lattice_best = make_match(points)
-    track = gen_track(states, edges_proj, lattice_best, points)
-    sys.stdout.buffer.write(track.SerializeToString())
+    for points_segment in disconnect_segments(points):
+        states, edges_proj, lattice_best = make_match(points_segment)
+        out.t.append(
+            gen_track(states, edges_proj, lattice_best, points_segment))
+    sys.stdout.buffer.write(out.SerializeToString())
 
 
 if __name__ == '__main__':

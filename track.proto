@@ -31,3 +31,8 @@ message TrackPoint {
 message Track {
   repeated TrackPoint p = 1;
 }
+
+// A sequence of tracks with discontinuities in between.
+message TrackSequence {
+  repeated Track t = 1;
+}

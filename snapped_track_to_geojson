@@ -7,8 +7,8 @@ from osmcachelib import get_node_data
 import track_pb2
 
 
-track = track_pb2.Track()
-track.ParseFromString(sys.stdin.buffer.read())
+seq = track_pb2.TrackSequence()
+seq.ParseFromString(sys.stdin.buffer.read())
 
 def get_triples(track):
     for p in track.p:
@@ -29,20 +29,21 @@ def get_triples(track):
             raise RuntimeError('no point in TrackPoint')
         yield lon, lat, p.elevation
 
-coordinates = list(get_triples(track))
-
 geojson = {
     'type': 'FeatureCollection',
-    'features': [{
+    'features': [],
+}
+
+for track in seq.t:
+    geojson['features'].append({
         'type': 'Feature',
         'properties': {
             'name': 'snapped',
         },
         'geometry': {
             'type': 'LineString',
-            'coordinates': coordinates,
+            'coordinates': list(get_triples(track)),
         },
-    }],
-}
+    })
 
 json.dump(geojson, sys.stdout)
