@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+
+import argparse
+import datetime
+import grpc
+import json
+import sys
+
+from osmcachelib import get_node_data
+import trackutil
+
+import td_feed_pb2
+import td_feed_pb2_grpc
+import track_pb2
+
+
+def _timestamp_arg(s: str) -> datetime.datetime:
+    return datetime.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S')
+
+
+def query_from_flags() -> td_feed_pb2.TDQuery:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-a', '--area', action='append',
+        help='TD area to query (1 or more). If not given, query all.')
+    parser.add_argument(
+        '-d', '--description', required=True,
+        help='Train describer (headcode) to query.')
+    parser.add_argument(
+        '-f', '--from', required=True, type=_timestamp_arg,
+        help='Beginning time of TD events to query.')
+    parser.add_argument(
+        '-t', '--to', required=True, type=_timestamp_arg,
+        help='End time of TD events to query.')
+    args = parser.parse_args()
+    q = td_feed_pb2.TDQuery(area_id=args.area, description=[args.description])
+    q.from_timestamp.FromDatetime(getattr(args, 'from'))
+    q.to_timestamp.FromDatetime(args.to)
+    return q
+
+
+def make_geojson_feature(name: str, p: track_pb2.TrackPoint):
+    if p.HasField('exact_node_id'):
+        node = get_node_data(p.exact_node_id)
+        node_element = node['elements'][0]
+        lat, lon = node_element['lat'], node_element['lon']
+    elif p.HasField('point_along_segment'):
+        # Here we just interpolate lat and lon directly without
+        # converting to cartesian. It's wrog but it will do.
+        node0 = get_node_data(p.point_along_segment.node_id_0)
+        node1 = get_node_data(p.point_along_segment.node_id_1)
+        e0 = node0['elements'][0]
+        e1 = node1['elements'][0]
+        lat = e0['lat'] + (e1['lat'] - e0['lat']) * p.point_along_segment.distance
+        lon = e0['lon'] + (e1['lon'] - e0['lon']) * p.point_along_segment.distance
+    else:
+        raise RuntimeError('no point in TrackPoint')
+    return {
+        'type': 'Feature',
+        'properties': { 'name': name },
+        'geometry': { 'type': 'Point', 'coordinates': [ lon, lat ] }
+    }
+
+
+def main():
+    q = query_from_flags()
+
+    seq = track_pb2.TrackSequence()
+    seq.ParseFromString(sys.stdin.buffer.read())
+    tsf = trackutil.TrackSequenceFollower(seq)
+
+    stub = td_feed_pb2_grpc.TDFeedStub(
+        grpc.insecure_channel('unix:/var/run/openraildata/td_archive.sock'))
+
+    features = []
+    for m in stub.Feed(q):
+        if not m.from_berth or not m.to_berth:
+            continue
+        p = tsf.fit_timestamp(m.timestamp.ToDatetime())
+        if p is not None:
+            name = m.from_berth + '→' + m.to_berth
+            features.append(make_geojson_feature(name, p))
+
+    json.dump({'type': 'FeatureCollection', 'features': features}, sys.stdout)
+
+
+if __name__ == '__main__':
+    main()
