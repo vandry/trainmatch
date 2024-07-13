@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import bisect
 import datetime
 import math
 
@@ -60,117 +61,12 @@ class WayData:
                 raise RuntimeError('expected nodes for TrackPoint %r to appear connsectively in way_id %d' % (p, self.way_id))
             return pos_v[0], pos_v[1]
 
-    def point_distance_to_end(self, p: track_pb2.TrackPoint, direction: int):
-        """Distance from p to the end of the way (direction=1) or back to start (-1)."""
-        d = 0.0
-        pos0, _ = self.point_pos_in_way(p)
-        if p.HasField('point_along_segment'):
-            # initially a fractional distance between these 2 points.
-            dx = self.node_distance_to_next[pos0]
-            if direction == 1:
-                fraction = 1.0 - p.point_along_segment.distance
-                pos0 += 1
-            else:
-                fraction = p.point_along_segment.distance
-            d = fraction * dx
-        # Plus each complete segment from here to the requested end
-        if direction == 1:
-            while pos0 < len(self.nodes) - 1:
-                d += self.node_distance_to_next[pos0]
-                pos0 += 1
-        else:
-            while pos0 > 0:
-                pos0 -= 1
-                d += self.node_distance_to_next[pos0]
-        return d
-
-    def create_point_between(self, t: datetime.datetime, p0: track_pb2.TrackPoint, p1: track_pb2.TrackPoint, direction: int):
-        p0_timestamp = p0.timestamp.ToDatetime()
-        dt_points = p1.timestamp.ToDatetime() - p0_timestamp
-        dt_desired = t - p0_timestamp
-        frac_desired = dt_desired / dt_points
-        p0_to_end = self.point_distance_to_end(p0, -1)
-        p1_to_end = self.point_distance_to_end(p1, -1)
-        dx = p1_to_end - p0_to_end
-        if dx >= 0.0:
-            desired_distance = p0_to_end + dx * frac_desired
-        else:
-            desired_distance = p1_to_end - dx * frac_desired
-
-        d_acc = 0.0
-        prev_node_id = self.nodes[0]
-        for node_id, distance_to_here in zip(self.nodes[1:], self.node_distance_to_next):
-            if d_acc + distance_to_here <= desired_distance:
-                d_acc += distance_to_here
-                if d_acc == desired_distance:  # exact hit
-                    p = track_pb2.TrackPoint(way_id=self.way_id, exact_node_id=node_id)
-                    p.timestamp.FromDatetime(t)
-                    return p
-                prev_node_id = node_id
-                continue
-            left_to_cover = desired_distance - d_acc
-            frac = left_to_cover / distance_to_here
-            assert 0.0 < frac < 1.0
-
-            p = track_pb2.TrackPoint(way_id=self.way_id)
-            pas = p.point_along_segment
-            pas.node_id_0 = prev_node_id
-            pas.node_id_1 = node_id
-            pas.distance = frac
-            p.timestamp.FromDatetime(t)
-            return p
-
-        raise RuntimeError('overran bounds, desired_distance too large')
-
 
 class WayFollower:
 
     def __init__(self, way: WayData, direction: int):
         self.way = way
         self.direction = direction
-        self.points = []
-        self.t0 = self.t1 = None
-
-    def fit_timestamp(self, t: datetime.datetime):
-        # Quick reject attempts later than we handle
-        if self.t1 is None:
-            if t > self.points[-1].timestamp.ToDatetime():
-                return None
-        elif t > self.t1:
-            return None
-
-        # Establish the first point or create a synthetic first point.
-        if self.t0 is None:
-            p_prev = self.points[0]
-            if t < p_prev.timestamp.ToDatetime():  # quick reject
-                return None
-        else:
-            if t < self.t0:  # quick reject
-                return None
-            # synthetic point
-            t0_node_id = self.way.nodes[0 if self.direction == 1 else -1]
-            p_prev = track_pb2.TrackPoint(way_id=self.way.way_id, exact_node_id=t0_node_id)
-            p_prev.timestamp.FromDatetime(self.t0)
-            if t == self.t0:
-                return p_prev
-
-        for p in self.points:
-            p_t = p.timestamp.ToDatetime()
-            if t == p_t:
-                return p
-            if p is p_prev:
-                continue  # happens if self.t0 is None above. We need one more point.
-            if t > p_t:
-                continue  # keep searching
-            return self.way.create_point_between(t, p_prev, p, self.direction)
-
-        # after last point
-        end_node_id = self.way.nodes[-1 if self.direction == 1 else 0]
-        p_end = track_pb2.TrackPoint(way_id=self.way.way_id, exact_node_id=end_node_id)
-        p_end.timestamp.FromDatetime(self.t1)
-        if t == self.t1:
-            return p_end
-        return self.way.create_point_between(t, self.points[-1], p_end, self.direction)
 
 
 class TrackFollowerCursor(tuple):
@@ -279,6 +175,7 @@ class TrackFollowerCursor(tuple):
 class TrackFollower:
 
     def __init__(self, t: track_pb2.Track, get_way):
+        self.track = t
         p0 = t.p[0]
         way0 = get_way(p0.way_id)
         p0_pos = way0.point_pos_in_way(p0)
@@ -307,19 +204,21 @@ class TrackFollower:
             raise RuntimeError('cannot determine travel direction at point %r' % (p,))
 
         f = WayFollower(way0, direction)
-        f.points.append(p0)
         self.ways = [f]
+        self.point_index_to_way_index = []
+        prev_p = t.p[0]
 
         for p in t.p[1:]:
             way1 = get_way(p.way_id)
             if way1.way_id == f.way.way_id:
-                 p0_pos = f.way.point_pos_in_way(f.points[-1])
+                 p0_pos = f.way.point_pos_in_way(prev_p)
                  p1_pos = f.way.point_pos_in_way(p)
                  if p0_pos != p1_pos:
                      direction = 1 if p1_pos > p0_pos else -1
                      if direction != f.direction:
                          raise RuntimeError('direction not monotonic: established direction %d, direction from %r to %r is %d' % (f.direction, f.points[-1], p, direction))
-                 f.points.append(p)
+                 self.point_index_to_way_index.append(len(self.ways) - 1)
+                 prev_p = p
                  continue
             # New way
             if f.direction == 1:
@@ -335,32 +234,38 @@ class TrackFollower:
             else:
                 raise RuntimeError('way %d is not connected end to end with the %s of way %d' % (way1.way_id, ('end' if f.direction == 1 else 'beginning'), f.way.way_id))
             f = WayFollower(way1, direction)
-            f.points.append(p)
             self.ways.append(f)
-
-        # Compute the time we joined and left each way.
-        for i in range(1, len(self.ways)):
-            f0 = self.ways[i-1]
-            f1 = self.ways[i]
-            t0 = f0.points[-1].timestamp.ToDatetime()
-            dt = f1.points[0].timestamp.ToDatetime() - t0
-            dx0 = f0.way.point_distance_to_end(f0.points[-1], f0.direction)
-            dx1 = f1.way.point_distance_to_end(f1.points[0], -f1.direction)
-            dx = dx0 + dx1
-            # Interpolate constant velocity between the 2 points.
-            t = t0 + dt * (dx0 / dx)
-            f0.t1 = t
-            f1.t0 = t
+            self.point_index_to_way_index.append(len(self.ways) - 1)
+            prev_p = p
 
     def fit_timestamp(self, t: datetime.datetime):
-        if t < self.ways[0].points[0].timestamp.ToDatetime():
+        if t < self.track.p[0].timestamp.ToDatetime():
             return None
-        if t > self.ways[-1].points[-1].timestamp.ToDatetime():
+        if t > self.track.p[-1].timestamp.ToDatetime():
             return None
-        for wf in self.ways:
-            point = wf.fit_timestamp(t)
-            if point is not None:
-                return point
+        i = bisect.bisect(self.track.p, t, key=lambda p: p.timestamp.ToDatetime())
+        p_before = self.track.p[i-1]
+        p_after = self.track.p[i]
+        wfi = self.point_index_to_way_index[i-1]
+        wf = self.ways[wfi]
+        if wf.direction == 1:
+            cursor = TrackFollowerCursor(self, wfi, 0, 0.0, 0.0)
+        else:
+            cursor = TrackFollowerCursor(self, wfi, len(wf.way.nodes) - 2, 1.0, 0.0)
+        cursor_before = cursor.travel_to_point(p_before)
+        cursor_after = cursor_before.travel_to_point(p_after)
+
+        # Interpolate assuming constant velocity.
+        dx = cursor_after.odometer() - cursor_before.odometer()
+        dt = p_after.timestamp.ToDatetime() - p_before.timestamp.ToDatetime()
+        want_dt = t - p_before.timestamp.ToDatetime()
+        want_dx = dx * (want_dt / dt)
+        cursor = cursor_before.travel_to_odometer(cursor_before.odometer() + want_dx)
+
+        p = track_pb2.TrackPoint()
+        p.timestamp.FromDatetime(t)
+        cursor.set_point(p)
+        return p
 
     def begin(self):
         """Return a TrackFollowerCursor located at the track of this track."""
