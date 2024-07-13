@@ -1,0 +1,61 @@
+#!/usr/bin/python3
+
+import sys
+
+import trackutil
+import track_pb2
+
+
+def offset_track(tf: trackutil.TrackFollower, old_t: track_pb2.Track, new_t: track_pb2.Track, distance: float):
+    new_t.ClearField('p')
+    here = tf.begin()
+    ahead = here
+
+    for p in old_t.p:
+        here = here.travel_to_point(p)
+        ahead = ahead.travel_to_odometer(here.odometer() + distance)
+        if ahead is None:
+            break
+        ahead_p = track_pb2.TrackPoint()
+        ahead_p.CopyFrom(p)
+        ahead.set_point(ahead_p)
+        new_t.p.append(ahead_p)
+
+
+def offset_seq(in_seq: track_pb2.TrackSequence, distance: float):
+    """Offset each point in a TrackSequence 'distance' ahead.
+
+    Replace the location of each point in the track with a location that is
+    'distance' ahead of it along the forward direction of the track. The
+    timestamp and other attributes of the point remain the same. If the
+    track does not extend for 'distance' ahead of the old location then drop
+    the point.
+
+    This is meant to adjust the locations to represent the location of the
+    front of the train when the track way actually recorded 'distance' back
+    from the front.
+    """
+    tsf = trackutil.TrackSequenceFollower(in_seq)
+    out_seq = track_pb2.TrackSequence()
+    out_seq.CopyFrom(in_seq)
+    for tf, old_t, new_t in zip(tsf.tracks, in_seq.t, out_seq.t):
+         offset_track(tf, old_t, new_t, distance)
+    return out_seq
+
+
+def main():
+    if len(sys.argv) != 2:
+        print('Usage:', sys.argv[0], 'offset-in-metres', file=sys.stderr)
+        sys.exit(1)
+    m = float(sys.argv[1])
+    Rearth = 6367000.0
+
+    seq = track_pb2.TrackSequence()
+    seq.ParseFromString(sys.stdin.buffer.read())
+    seq = offset_seq(seq, m / Rearth)
+
+    sys.stdout.buffer.write(seq.SerializeToString())
+
+
+if __name__ == '__main__':
+    main()

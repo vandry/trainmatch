@@ -173,6 +173,109 @@ class WayFollower:
         return self.way.create_point_between(t, self.points[-1], p_end, self.direction)
 
 
+class TrackFollowerCursor(tuple):
+    """Marks a precise position along a Track,with methods for moving forward."""
+
+    def __new__(self, tf, wfi: int, ni: int, frac_after_node: float, odometer: float):
+        return tuple.__new__(TrackFollowerCursor, (tf, wfi, ni, frac_after_node, odometer))
+
+    def odometer(self):
+        return self[4]
+
+    def _travel(self, get_want_frac):
+        tf, wfi, ni, frac_after_node, odometer = self
+        wf = tf.ways[wfi]
+        while True:
+            want_frac = get_want_frac(wf, ni, frac_after_node, odometer)
+            if want_frac is not None:
+                break  # We have reached the correct node
+            next_way = False
+            if wf.direction == 1:
+                odometer += wf.way.node_distance_to_next[ni] * (1.0 - frac_after_node)
+                frac_after_node = 0.0
+                ni += 1
+                if ni == len(wf.way.node_distance_to_next):
+                    next_way = True
+            else:
+                odometer += wf.way.node_distance_to_next[ni] * frac_after_node
+                frac_after_node = 1.0
+                ni -= 1
+                if ni == -1:
+                    next_way = True
+            if next_way:
+                wfi += 1
+                if wfi >= len(tf.ways):
+                    return None
+                wf = tf.ways[wfi]
+                if wf.direction == 1:
+                    ni = 0
+                    frac_after_node = 0.0
+                else:
+                    ni = len(wf.way.nodes) - 2
+                    frac_after_node = 1.0
+        to_move = want_frac - frac_after_node
+        if (to_move < 0.0) if wf.direction == 1 else (to_move > 0.0):
+            raise RuntimeError('TrackFollowerCursor already past the desired point')
+        frac_after_node += to_move
+        odometer += math.fabs(to_move) * wf.way.node_distance_to_next[ni]
+        return type(self)(tf, wfi, ni, frac_after_node, odometer)
+
+    def travel_to_point(self, p: track_pb2.TrackPoint):
+        """Travel forward to the position of TrackPoint p, return new cursor."""
+        if p.HasField('exact_node_id'):
+            want_node0, want_node1, want_frac = p.exact_node_id, p.exact_node_id, 0.0
+            def get_want_frac(wf: WayFollower, ni: int, frac_after_node: float, odometer: float):
+                if wf.way.way_id != p.way_id:
+                    return None
+                if wf.way.nodes[ni] == p.exact_node_id:
+                    return 0.0
+                if wf.way.nodes[ni + 1] == p.exact_node_id:
+                    return 1.0
+                return None
+        elif p.HasField('point_along_segment'):
+            def get_want_frac(wf: WayFollower, ni: int, frac_after_node: float, odometer: float):
+                if wf.way.way_id != p.way_id:
+                    return None
+                if wf.way.nodes[ni] == p.point_along_segment.node_id_0:
+                    return p.point_along_segment.distance
+                return None
+        else:
+            raise RuntimeError('no point in TrackPoint')
+        return self._travel(get_want_frac)
+
+    def travel_to_odometer(self, desired_odometer: float):
+        """Travel forward until the desired cumulative travel distance, return new cursor."""
+        def get_want_frac(wf: WayFollower, ni: int, frac_after_node: float, odometer: float):
+            this_interval_distance = wf.way.node_distance_to_next[ni]
+            if wf.direction == 1:
+                odometer_at_node0 = odometer - this_interval_distance * frac_after_node
+                want_frac = (desired_odometer - odometer_at_node0) / this_interval_distance
+                if want_frac > 1.0:
+                    return None
+            else:
+                odometer_at_node1 = odometer - this_interval_distance * (1.0 - frac_after_node)
+                want_frac = 1.0 - ((desired_odometer - odometer_at_node1) / this_interval_distance)
+                if want_frac < 0.0:
+                    return None
+            return want_frac
+        return self._travel(get_want_frac)
+
+    def set_point(self, p: track_pb2.TrackPoint):
+        """Override the position in TrackPoint p to that of this cursor."""
+        tf, wfi, ni, frac_after_node, _ = self
+        wf = tf.ways[wfi]
+        p.way_id = wf.way.way_id
+        if frac_after_node == 0.0:
+            p.exact_node_id = wf.way.nodes[ni]
+        elif frac_after_node == 1.0:
+            p.exact_node_id = wf.way.nodes[ni + 1]
+        else:
+            pas = p.point_along_segment
+            pas.node_id_0 = wf.way.nodes[ni]
+            pas.node_id_1 = wf.way.nodes[ni + 1]
+            pas.distance = frac_after_node
+
+
 class TrackFollower:
 
     def __init__(self, t: track_pb2.Track, get_way):
@@ -258,6 +361,13 @@ class TrackFollower:
             point = wf.fit_timestamp(t)
             if point is not None:
                 return point
+
+    def begin(self):
+        """Return a TrackFollowerCursor located at the track of this track."""
+        if self.ways[0].direction == 1:
+            return TrackFollowerCursor(self, 0, 0, 0.0, 0.0)
+        else:
+            return TrackFollowerCursor(self, 0, len(self.ways[0].way.nodes) - 2, 1.0, 0.0)
 
 
 class TrackSequenceFollower:
