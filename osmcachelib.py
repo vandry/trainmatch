@@ -35,3 +35,12 @@ def get_node_data(oid):
     except:
         print(f"Unable to parse: {data}", file=sys.stderr)
         raise
+
+
+def get_node_way_data(oid):
+    data = get_request(f"https://www.openstreetmap.org/api/0.6/node/{oid}/ways.json")
+    try:
+        return json.loads(data)
+    except:
+        print(f"Unable to parse: {data}", file=sys.stderr)
+        raise

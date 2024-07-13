@@ -4,7 +4,7 @@ import bisect
 import datetime
 import math
 
-from osmcachelib import get_way_data, get_node_data
+from osmcachelib import get_way_data, get_node_data, get_node_way_data
 import track_pb2
 
 
@@ -172,6 +172,42 @@ class TrackFollowerCursor(tuple):
             pas.distance = frac_after_node
 
 
+def _search_for_way(seen: set, get_way, here: WayFollower, want_way: WayData, depth: int):
+    seen.add(here.way.way_id)
+    if here.direction == 1:
+        old_way_last_node = here.way.nodes[-1]
+    else:
+        old_way_last_node = here.way.nodes[0]
+    if old_way_last_node == want_way.nodes[0]:
+        # The last node of the old way appears at the beginning of the new way.
+        return [WayFollower(want_way, 1)]
+    elif old_way_last_node == want_way.nodes[-1]:
+        # The last node of the old way appears at the end of the new way.
+        return [WayFollower(want_way, -1)]
+    if depth == 0:
+        return []
+
+    membership_data = get_node_way_data(old_way_last_node)
+    for element in membership_data['elements']:
+        if element['type'] != 'way':
+            continue
+        next_way_id = element['id']
+        if next_way_id in seen:
+            continue
+        next_way = get_way(next_way_id)
+        if old_way_last_node == next_way.nodes[0]:
+            next_wf = WayFollower(next_way, 1)
+        elif old_way_last_node == next_way.nodes[-1]:
+            next_wf = WayFollower(next_way, -1)
+        else:
+            #raise RuntimeError('way %d is not connected end to end with the %s of way %d' % (next_way_id, ('end' if here.direction == 1 else 'beginning'), here.way.way_id))
+            continue
+        path = _search_for_way(seen, get_way, next_wf, want_way, depth - 1)
+        if path:
+            return [next_wf] + path
+    return []
+
+
 class TrackFollower:
 
     def __init__(self, t: track_pb2.Track, get_way):
@@ -205,7 +241,7 @@ class TrackFollower:
 
         f = WayFollower(way0, direction)
         self.ways = [f]
-        self.point_index_to_way_index = []
+        self.point_index_to_way_index = [0]
         prev_p = t.p[0]
 
         for p in t.p[1:]:
@@ -221,20 +257,11 @@ class TrackFollower:
                  prev_p = p
                  continue
             # New way
-            if f.direction == 1:
-                old_way_last_node = f.way.nodes[-1]
-            else:
-                old_way_last_node = f.way.nodes[0]
-            if old_way_last_node == way1.nodes[0]:
-                # The last node of the old way appears at the beginning of the new way.
-                direction = 1
-            elif old_way_last_node == way1.nodes[-1]:
-                # The last node of the old way appears at the end of the new way.
-                direction = -1
-            else:
-                raise RuntimeError('way %d is not connected end to end with the %s of way %d' % (way1.way_id, ('end' if f.direction == 1 else 'beginning'), f.way.way_id))
-            f = WayFollower(way1, direction)
-            self.ways.append(f)
+            path = _search_for_way(set(), get_way, f, way1, 10)
+            if not path:
+                raise RuntimeError('unable to find a path from the %s of way %d to way %d' % (('end' if f.direction == 1 else 'beginning'), f.way.way_id, way1.way_id))
+            f = path[-1]
+            self.ways.extend(path)
             self.point_index_to_way_index.append(len(self.ways) - 1)
             prev_p = p
 
@@ -243,8 +270,13 @@ class TrackFollower:
             return None
         if t > self.track.p[-1].timestamp.ToDatetime():
             return None
-        i = bisect.bisect(self.track.p, t, key=lambda p: p.timestamp.ToDatetime())
+        a = [p.timestamp.ToDatetime() for p in self.track.p]
+        i = bisect.bisect(a, t)
         p_before = self.track.p[i-1]
+        if t == p_before.timestamp.ToDatetime():
+            p = track_pb2.TrackPoint()
+            p.CopyFrom(p_before)
+            return p
         p_after = self.track.p[i]
         wfi = self.point_index_to_way_index[i-1]
         wf = self.ways[wfi]
